@@ -1,167 +1,132 @@
-# make_proto.py
+# sc_make_proto_auto
 
-Dumps the gRPC telemetry schema out of `StarCitizen.exe` and writes it as a normal `.proto` file.
+Automatically generate the Star Citizen game telemetry `.proto` schema from your installed game.
 
-Star Citizen's built-in telemetry server has gRPC reflection switched off and CIG doesn't publish a `.proto`. The game does embed the full schema in the executable (every message, field name, field number, enum and rpc), so this script finds it, decodes it and writes it back out as `.proto` text that `protoc` can compile.
+`make_proto.py` waits for `StarCitizen.exe` to start. It then reads the protobuf schema of the game's telemetry gRPC API (`GameTelemetryService`) from the executable and writes it out as a single `.proto` file. The file builds on its own and is named after the game's file version:
 
-> Unofficial and undocumented. CIG can change or remove any of this in a patch, which is why the script reads the schema from the exe instead of hardcoding it. Re-run it after each patch.
+```
+sc_telemetry_4.10.201.48085.proto
+```
+
+Because the schema comes from whichever executable is running, you always get the version that matches your game build, LIVE or PTU.
+
+## Compatibility
+
+Currently compatible with Star Citizen **4.10.x** and **5.0.x**.
+
+| Channel | Launcher build | StarCitizen.exe file version |
+|---|---|---|
+| LIVE | 4.10.3-live.13220821 | 4.10.201.48085 |
+| PTU | 5.0.0-ptu.13248297 | 5.0.202.10025 |
+
+> **Important:** for each environment (LIVE, PTU, ...), the game must be loaded to at least the **main menu** to build the proto schema for that environment.
+
+The launcher build is the version shown in the RSI Launcher. The file version is the one read from `StarCitizen.exe` and used in the generated file name, e.g. `sc_telemetry_4.10.201.48085.proto`.
 
 ## Requirements
 
-- Python 3.8+
-- The `protobuf` package (installed automatically with `grpcio-tools`)
+- Windows
+- Python 3.10 or newer (tested with 3.15.2)
+- The [`protobuf`](https://pypi.org/project/protobuf/) package
+- Star Citizen installed
 
 ```
 pip install -r requirements.txt
 ```
 
-`make_proto.py` itself only needs `protobuf`. `grpcio` and `grpcio-tools` are for compiling the result and reading the stream.
-
-The script only reads the exe. It doesn't need the game running, the telemetry server enabled, or a network connection.
-
-## Quick start
-
-```
-python make_proto.py -LIVE -telemetry_live
-```
-
-This reads:
-
-```
-D:\Roberts Space Industries\StarCitizen\LIVE\Bin64\StarCitizen.exe
-```
-
-and writes `telemetry_live.proto` in the same folder as `make_proto.py`, wherever you run the command from.
-
 ## Usage
 
 ```
-python make_proto.py -<ENVIRONMENT> -<FILENAME> [--base DIR] [--out-dir DIR] [--match PREFIX]
+python make_proto.py
 ```
 
-| Argument | Meaning |
-|---|---|
-| `-<ENVIRONMENT>` | Environment folder name, such as `-LIVE` or `-PTU`. Matched case-insensitively, so `-ptu` finds the `PTU` folder. |
-| `-<FILENAME>` | Output filename. `.proto` is appended for you. Typing `.proto` yourself is fine; it isn't doubled. Must not contain a path. |
-| `--base DIR` | Folder that contains the environment folders. See below for the default. |
-| `--out-dir DIR` | Where to write the file. Defaults to the same folder as the script, and is created if missing. A relative path is relative to the folder you run the command from. |
-| `--match PREFIX` | Which embedded `.proto` files to extract. Default `sc/game/telemetry/`. |
-| `-h`, `--help` | Show the built-in help. |
-
-The environment and filename are the two dashed words, in that order.
-
-### Examples
+1. Run the script. It prints `Waiting for StarCitizen.exe to start...`.
+2. Launch Star Citizen, either LIVE or PTU, and let it load to at least the **main menu**. If the game is already running, the script continues straight away.
+3. The script writes the `.proto` file next to itself and exits:
 
 ```
-python make_proto.py -LIVE -telemetry_live
-python make_proto.py -PTU -telemetry_ptu
-python make_proto.py -LIVE -telemetry_live --base "E:\Games\StarCitizen"
-python make_proto.py -PTU -telemetry_ptu --out-dir protos
+Waiting for StarCitizen.exe to start...
+Wrote F:\...\sc_make_proto_auto\sc_telemetry_4.10.201.48085.proto
 ```
 
-## How the exe path is built
+The `.proto` file is always written to the folder that contains `make_proto.py`, not to the game's folder (e.g. `...\StarCitizen\LIVE\Bin64\`). This is the same whichever folder you run the script from.
 
-```
-{base}\{environment}\Bin64\StarCitizen.exe
-```
+If a file with the same name already exists, it is overwritten.
 
-The base folder is taken from the first of these that is set:
+## Output
 
-1. `--base "D:\Roberts Space Industries\StarCitizen"`
-2. The `SC_BASE_DIR` environment variable
-3. `DEFAULT_BASE` at the top of `make_proto.py`
+The generated file starts with a header that says what it is and which game build it matches:
 
-To set it once and forget about it, either edit `DEFAULT_BASE` or run:
+```proto
+syntax = "proto3";
+package sc.game.telemetry.v1;
 
-```
-setx SC_BASE_DIR "D:\Roberts Space Industries\StarCitizen"
-```
+// ---- Star Citizen game telemetry gRPC schema ----
+//
+// What it is: the protobuf schema of the game's telemetry gRPC API (GameTelemetryService),
+// including the telemetry frame messages it streams.
+//
+// Compatible with: StarCitizen.exe file version 4.10.201.48085 (LIVE).
+// Other game versions may add, remove or change fields.
+// ...
 
-(Open a new terminal afterwards so the variable is picked up.)
+message Availability { bool enabled = 1; bool active = 2; }
+message Gauge { float current = 1; float max = 2; }
 
-## What you get
-
-A single merged `.proto` containing everything under `sc/game/telemetry/` (currently `types.proto` and `api.proto`), with dependencies first:
-
-- `syntax`, `package`, all messages and enums with their real field numbers
-- the `GameTelemetryService` definition, including `stream` markers
-
-The script prints a summary when it finishes:
-
-```
-reading D:\Roberts Space Industries\StarCitizen\LIVE\Bin64\StarCitizen.exe
-found 2 files: sc/game/telemetry/v1/types.proto, sc/game/telemetry/v1/api.proto
-28 messages; services: GameTelemetryService (1 rpc)
-wrote telemetry_live.proto
-```
-
-It also checks that every type the output refers to is defined in it, and prints a warning if not.
-
-## Using the result
-
-Compile it:
-
-```
-python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. telemetry_live.proto
+message VehicleDoorState {
+  enum DoorOpenState { DOOR_OPEN_STATE_UNSPECIFIED = 0; DOOR_OPEN_STATE_OPENED = 1; DOOR_OPEN_STATE_CLOSED = 2; }
+  enum DoorLockState { DOOR_LOCK_STATE_UNSPECIFIED = 0; DOOR_LOCK_STATE_UNLOCKED = 1; DOOR_LOCK_STATE_LOCKED = 2; }
+  DoorOpenState open_state = 1;
+  DoorLockState lock_state = 2;
+}
+...
+service GameTelemetryService {
+  rpc TelemetryStream(TelemetryStreamRequest) returns (stream TelemetryStreamResponse);
+  rpc TriggerGameAction(TriggerGameActionRequest) returns (TriggerGameActionResponse);
+  rpc ListTriggerableActions(ListTriggerableActionsRequest) returns (ListTriggerableActionsResponse);
+}
 ```
 
-This creates `telemetry_live_pb2.py` and `telemetry_live_pb2_grpc.py`. Then read the stream:
+The game ships the schema as two files, `sc/game/telemetry/v1/types.proto` and `sc/game/telemetry/v1/api.proto`. Both use the same package, so the script merges them into one file and drops the import between them.
 
-```python
-import grpc, time
-import telemetry_live_pb2 as pb
-import telemetry_live_pb2_grpc as pbg
+## Building the schema
 
-while True:
-    try:
-        ch = grpc.insecure_channel("127.0.0.1:2942")
-        stub = pbg.GameTelemetryServiceStub(ch)
-        for r in stub.TelemetryStream(pb.TelemetryStreamRequest()):
-            print(r.actor.vitals.health.current, r.actor.state.uec_balance)
-    except grpc.RpcError:
-        time.sleep(3)
-```
-
-The server only exists when the game was started with the environment variable set:
+The generated file compiles with `protoc` as is. For example, using `grpcio-tools`:
 
 ```
-setx GRPC_CLIENT_SERVER_ENABLED true
+pip install grpcio-tools
+python -m grpc_tools.protoc -I. --descriptor_set_out=sc_telemetry.pb sc_telemetry_4.10.201.48085.proto
 ```
 
-Then fully exit the RSI launcher (system tray) and restart it. The game listens on `127.0.0.1:2942`.
-
-### LIVE and PTU together
-
-Both builds use the same package and message names, so their generated Python modules would clash if loaded together. If you keep both, generate and compile each in its own folder:
-
-```
-python make_proto.py -LIVE -telemetry --out-dir live
-python make_proto.py -PTU  -telemetry --out-dir ptu
-```
-
-PTU is a superset of LIVE at the time of writing. It adds vehicle `shields`, `health` and `master_mode`, plus the `TriggerGameAction` and `ListTriggerableActions` methods. `TriggerGameAction` **sends input to the game** instead of just reading data, so test it carefully and check the anti-cheat and terms-of-service side first. A method that exists in the PTU proto will return `UNIMPLEMENTED` on a LIVE server that doesn't have it yet.
-
-## Troubleshooting
-
-| Message | Cause and fix |
-|---|---|
-| `base folder not found` | The base path is wrong. Pass `--base` or set `SC_BASE_DIR`. |
-| `not found: ...StarCitizen.exe` | The environment folder doesn't exist or has no `Bin64\StarCitizen.exe`. The error lists the environments it did find. |
-| `expected an environment and a filename` | You need exactly two dashed words, e.g. `-LIVE -telemetry_live`. |
-| `the filename can't contain a path` | Use `--out-dir` for the folder. |
-| `no embedded ... descriptors found` | The build may have stripped the schema, or the path prefix changed. Try `--match` with a different prefix. |
-| `warning: types referenced but not defined` | The dump is incomplete, which can happen if a descriptor was cut short. Report which types were listed. |
-| `This needs the protobuf package` | `pip install protobuf` (or `grpcio-tools`). |
+> **Note for Python code generation:** `protoc` names generated Python modules after the `.proto` file, e.g. `sc_telemetry_4.10.201.48085_pb2.py`. Python cannot import a module whose name contains dots, so copy or rename the file first, for example to `sc_telemetry.proto`:
+>
+> ```
+> copy sc_telemetry_4.10.201.48085.proto sc_telemetry.proto
+> python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. sc_telemetry.proto
+> ```
 
 ## How it works
 
-1. A serialized `.proto` description starts with the bytes `0x0A <length> <file name>`, so the script scans the exe for those, using a memory map so the large file isn't loaded into RAM.
-2. For each hit it walks the top-level fields to find where the descriptor ends, then lets `protobuf` parse it. Hits that fail the length check or don't parse are skipped, and duplicate copies are kept once.
-3. The descriptors are sorted so dependencies come first and rendered as `.proto` text, handling nested types, oneofs, maps, reserved ranges and streaming rpcs.
+1. **Find the game:** it lists running processes using the Windows API (`CreateToolhelp32Snapshot`) and checks every 2 seconds until `StarCitizen.exe` appears.
+2. **Find the exe:** it reads the full executable path of the process (`QueryFullProcessImageNameW`).
+3. **Read the version:** it reads the numeric **File version** from the executable's version resource, the same value shown under *Properties > Details*.
+4. **Find the schema:** it searches the executable for the embedded protobuf `FileDescriptorProto` data whose file names start with `sc/game/telemetry/`, and parses it with `protobuf`.
+5. **Rebuild the `.proto`:** it merges the descriptors and turns them back into `.proto` source. Small definitions go on one line; larger ones span several lines.
+6. **Write the file:** it saves the result as `sc_telemetry_{file_version}.proto`.
+
+Apart from the `protobuf` package, it uses only the Python standard library (`ctypes`). It does not need admin rights. After the game is found, a run takes about 0.2 seconds.
 
 ## Limitations
 
-- Only tested against synthetic `StarCitizen.exe` files built from the real LIVE and PTU schemas. If your real exe behaves differently, such as finding nothing, that's worth reporting.
-- It recovers names and field numbers, but not units or meanings. For example, altitude and heading have no unit in the schema.
-- The output isn't guaranteed to be byte-for-byte what CIG wrote; it's an equivalent reconstruction. Comments and original formatting aren't stored in the exe.
-- Output is valid proto3, but nested references appear fully qualified (`VehicleDoorState.DoorOpenState`) rather than shortened.
+- **No comments:** the original `.proto` comments are not stored in the executable, so the generated file only has its header comment.
+- **Tied to one build:** each file matches the game build it was generated from. Generate it again after a patch.
+- **First match only:** if more than one `StarCitizen.exe` is running, the first one found is used.
+- **Windows only.**
+
+## License
+
+This project is licensed under the [GNU General Public License v3.0](LICENSE).
+
+## Disclaimer
+
+This is an unofficial fan project and is not affiliated with or endorsed by Cloud Imperium Games. Star Citizen® is a registered trademark of Cloud Imperium Rights LLC. The script reads files from your own local game installation and does not connect to or modify the game.

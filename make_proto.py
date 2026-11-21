@@ -1,578 +1,735 @@
-#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Generate the Star Citizen telemetry .proto schema from the game.
+
+Waits for StarCitizen.exe to start, reads its file version, extracts
+the embedded gRPC telemetry protobuf descriptors from the executable,
+and writes them as a single buildable ``sc_telemetry_{version}.proto``
+file next to this script.
 """
-make_proto.py - dump the gRPC telemetry schema out of StarCitizen.exe and
-write it as a .proto file.
 
-WHY THIS EXISTS
-    Star Citizen's built-in telemetry server (127.0.0.1:2942) has gRPC
-    reflection switched off and CIG doesn't publish a .proto file. But the
-    game was compiled with the full protobuf runtime, so the complete schema
-    (every message, field name, field number, enum and rpc) is embedded in
-    StarCitizen.exe as serialized "FileDescriptorProto" blobs. This script
-    finds those blobs, decodes them, and writes them back out as ordinary
-    .proto text that `protoc` / grpc_tools can compile.
-
-USAGE
-    python make_proto.py -<ENVIRONMENT> -<FILENAME> [options]
-
-    -<ENVIRONMENT>   The game environment folder, e.g. -LIVE or -PTU.
-                     Matched case-insensitively (-ptu finds the PTU folder).
-    -<FILENAME>      Name for the output file. ".proto" is appended for you
-                     (typing it yourself is fine, it won't be doubled).
-                     Must not contain a path; use --out-dir for the folder.
-
-    Options:
-      --base DIR      Folder that contains the environment folders.
-      --out-dir DIR   Where to write the .proto (default: the same folder
-                      as this script, wherever you run it from).
-      --match PREFIX  Which embedded .proto files to extract
-                      (default: sc/game/telemetry/).
-      -h, --help      Show this text.
-
-EXAMPLES
-    python make_proto.py -LIVE -telemetry_live
-        reads  D:\\Roberts Space Industries\\StarCitizen\\LIVE\\Bin64\\StarCitizen.exe
-        writes telemetry_live.proto next to make_proto.py
-
-    python make_proto.py -PTU -telemetry_ptu
-        reads  ...\\PTU\\Bin64\\StarCitizen.exe, writes .\\telemetry_ptu.proto
-
-    python make_proto.py -LIVE -telemetry_live --base "E:\\Games\\StarCitizen"
-        game installed somewhere else
-
-    python make_proto.py -PTU -telemetry_ptu --out-dir protos
-        write into a "protos" folder (created if missing)
-
-THE EXE PATH
-    {base}\\{environment}\\Bin64\\StarCitizen.exe
-
-    The base folder is chosen in this order:
-      1. --base "D:\\Roberts Space Industries\\StarCitizen"
-      2. the SC_BASE_DIR environment variable
-      3. DEFAULT_BASE below (edit it once and forget about it)
-
-AFTER YOU HAVE THE .proto
-    python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. telemetry_live.proto
-    (this creates telemetry_live_pb2.py and telemetry_live_pb2_grpc.py)
-
-REQUIREMENTS
-    Python 3.8+ and the `protobuf` package (installed with grpcio-tools).
-    No network access and no game process needed; it only reads the exe.
-"""
-import datetime
+import ctypes
 import mmap
-import os
-import re
-import sys
+import time
+from collections.abc import Iterator
+from ctypes import wintypes
+from pathlib import Path
 
-# ----------------------------------------------------------------------------
-# Settings you may want to edit
-# ----------------------------------------------------------------------------
+from google.protobuf import descriptor_pb2
 
-# Folder that holds the environment folders (LIVE, PTU, ...). Used when neither
-# --base nor the SC_BASE_DIR environment variable is given.
-DEFAULT_BASE = r"D:\Roberts Space Industries\StarCitizen"
+EXE_NAME = "StarCitizen.exe"
+CHECK_INTERVAL = 2  # Seconds between checks.
 
-# Only embedded .proto files whose name starts with this are extracted. The
-# telemetry schema lives under sc/game/telemetry/ (types.proto and api.proto).
-DEFAULT_MATCH = "sc/game/telemetry/"
+# An embedded .proto schema starts with its file name: byte 0x0A, a
+# one-byte name length, then the name. Telemetry schemas live under
+# this prefix.
+_TELEMETRY_PREFIX = b"sc/game/telemetry/"
 
-# Folder this script lives in. Output goes here unless --out-dir is given, so
-# the result lands next to make_proto.py no matter where you run it from.
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+# Signature that marks a valid VS_FIXEDFILEINFO structure.
+_VS_FFI_SIGNATURE = 0xFEEF04BD
 
-# What gets appended to {base}\{environment} to reach the executable.
-EXE_TAIL = os.path.join("Bin64", "StarCitizen.exe")
+# FileDescriptorProto field number -> allowed protobuf wire types. Used
+# to find where an embedded descriptor ends.
+_DESCRIPTOR_FIELDS = {
+    1: {2}, 2: {2}, 3: {2}, 4: {2}, 5: {2}, 6: {2}, 7: {2}, 8: {2},
+    9: {2}, 10: {0, 2}, 11: {0, 2}, 12: {2}, 14: {0},
+}
 
-try:
-    from google.protobuf import descriptor_pb2
-except ImportError:
-    sys.exit("This needs the protobuf package:  pip install protobuf")
-
-# Short alias; used a lot when rendering fields.
 FDP = descriptor_pb2.FieldDescriptorProto
 
+# A definition is printed on one line if it has no nested definitions
+# and fits within this many characters.
+LINE_LIMIT = 120
 
-# ============================================================================
-# 1. Command line handling
-# ============================================================================
-def die(msg):
-    """Print an error to stderr and exit with a non-zero status."""
-    print("error:", msg, file=sys.stderr)
-    sys.exit(1)
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+TH32CS_SNAPPROCESS = 0x00000002
+INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
 
 
-def parse_cli(argv):
+class PROCESSENTRY32W(ctypes.Structure):
+    """Mirror of the Win32 PROCESSENTRY32W structure."""
+
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ProcessID", wintypes.DWORD),
+        ("th32DefaultHeapID", ctypes.c_size_t),
+        ("th32ModuleID", wintypes.DWORD),
+        ("cntThreads", wintypes.DWORD),
+        ("th32ParentProcessID", wintypes.DWORD),
+        ("pcPriClassBase", wintypes.LONG),
+        ("dwFlags", wintypes.DWORD),
+        ("szExeFile", wintypes.WCHAR * 260),
+    ]
+
+
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+_kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+_kernel32.Process32FirstW.restype = wintypes.BOOL
+_kernel32.Process32FirstW.argtypes = [
+    wintypes.HANDLE,
+    ctypes.POINTER(PROCESSENTRY32W),
+]
+_kernel32.Process32NextW.restype = wintypes.BOOL
+_kernel32.Process32NextW.argtypes = [
+    wintypes.HANDLE,
+    ctypes.POINTER(PROCESSENTRY32W),
+]
+_kernel32.OpenProcess.restype = wintypes.HANDLE
+_kernel32.OpenProcess.argtypes = [
+    wintypes.DWORD,
+    wintypes.BOOL,
+    wintypes.DWORD,
+]
+_kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+_kernel32.QueryFullProcessImageNameW.argtypes = [
+    wintypes.HANDLE,
+    wintypes.DWORD,
+    wintypes.LPWSTR,
+    ctypes.POINTER(wintypes.DWORD),
+]
+_kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+_version = ctypes.WinDLL("version", use_last_error=True)
+_version.GetFileVersionInfoSizeW.restype = wintypes.DWORD
+_version.GetFileVersionInfoSizeW.argtypes = [
+    wintypes.LPCWSTR,
+    ctypes.POINTER(wintypes.DWORD),
+]
+_version.GetFileVersionInfoW.restype = wintypes.BOOL
+_version.GetFileVersionInfoW.argtypes = [
+    wintypes.LPCWSTR,
+    wintypes.DWORD,
+    wintypes.DWORD,
+    ctypes.c_void_p,
+]
+_version.VerQueryValueW.restype = wintypes.BOOL
+_version.VerQueryValueW.argtypes = [
+    ctypes.c_void_p,
+    wintypes.LPCWSTR,
+    ctypes.POINTER(ctypes.c_void_p),
+    ctypes.POINTER(wintypes.UINT),
+]
+
+
+class VS_FIXEDFILEINFO(ctypes.Structure):
+    """Mirror of the Win32 VS_FIXEDFILEINFO structure."""
+
+    _fields_ = [
+        ("dwSignature", wintypes.DWORD),
+        ("dwStrucVersion", wintypes.DWORD),
+        ("dwFileVersionMS", wintypes.DWORD),
+        ("dwFileVersionLS", wintypes.DWORD),
+        ("dwProductVersionMS", wintypes.DWORD),
+        ("dwProductVersionLS", wintypes.DWORD),
+        ("dwFileFlagsMask", wintypes.DWORD),
+        ("dwFileFlags", wintypes.DWORD),
+        ("dwFileOS", wintypes.DWORD),
+        ("dwFileType", wintypes.DWORD),
+        ("dwFileSubtype", wintypes.DWORD),
+        ("dwFileDateMS", wintypes.DWORD),
+        ("dwFileDateLS", wintypes.DWORD),
+    ]
+
+
+def find_pid(exe_name: str = EXE_NAME) -> int | None:
+    """Return the PID of the named process, or None if it is not running.
+
+    Args:
+        exe_name: The process image name to look for.
+
+    Returns:
+        The process ID, or None if no matching process is running.
     """
-    Parse the command line by hand (rather than argparse) so that the
-    environment and filename can be given as single-dash words:
+    snapshot = _kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if snapshot is None or snapshot == INVALID_HANDLE_VALUE:
+        return None
+    try:
+        target = exe_name.casefold()
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        entry_ref = ctypes.byref(entry)
+        found = _kernel32.Process32FirstW(snapshot, entry_ref)
+        while found:
+            if entry.szExeFile.casefold() == target:
+                return entry.th32ProcessID
+            found = _kernel32.Process32NextW(snapshot, entry_ref)
+        return None
+    finally:
+        _kernel32.CloseHandle(snapshot)
 
-        -LIVE -telemetry_live
 
-    argparse would treat those as unknown short flags. Rules used here:
-      * tokens starting with "--" are options (--base X or --base=X)
-      * every other token is positional; one leading "-" is stripped
-      * exactly two positionals are required: environment, then filename
+def get_exe_path(pid: int) -> str | None:
+    """Return the full path of the executable for a process.
 
-    Returns (environment, filename_without_extension, options_dict).
+    Args:
+        pid: The process ID.
+
+    Returns:
+        The full executable path, or None if it cannot be read.
     """
-    # Defaults for the options. The base folder falls back to SC_BASE_DIR,
-    # then to DEFAULT_BASE.
-    opts = {"base": os.environ.get("SC_BASE_DIR") or DEFAULT_BASE,
-            "out_dir": SCRIPT_DIR,
-            "match": DEFAULT_MATCH}
-    pos = []  # positional words, in the order given
-    i = 0
-    while i < len(argv):
-        a = argv[i]
-        if a in ("-h", "--help", "-?"):
-            print(__doc__)
-            sys.exit(0)
-        if a.startswith("--"):
-            # "--out-dir=foo" or "--out-dir foo"; dashes map to underscores
-            key, eq, val = a[2:].partition("=")
-            key = key.replace("-", "_")
-            if key not in opts:
-                die(f"unknown option {a}")
-            if not eq:                      # value is the next token
-                i += 1
-                if i >= len(argv):
-                    die(f"{a} needs a value")
-                val = argv[i]
-            opts[key] = val
-        else:
-            # "-LIVE" -> "LIVE"; a bare "LIVE" is accepted too
-            pos.append(a[1:] if a.startswith("-") and len(a) > 1 else a)
+    handle = _kernel32.OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+    )
+    if not handle:
+        return None
+    try:
+        buffer = ctypes.create_unicode_buffer(32768)
+        size = wintypes.DWORD(len(buffer))
+        if _kernel32.QueryFullProcessImageNameW(
+            handle, 0, buffer, ctypes.byref(size)
+        ):
+            return buffer.value
+        return None
+    finally:
+        _kernel32.CloseHandle(handle)
+
+
+def get_file_version(path: str) -> str | None:
+    """Return the "File version" shown in the file's Properties > Details.
+
+    Args:
+        path: Full path to the executable.
+
+    Returns:
+        The file version as "a.b.c.d", or None if it cannot be read.
+    """
+    size = _version.GetFileVersionInfoSizeW(path, None)
+    if not size:
+        return None
+    data = ctypes.create_string_buffer(size)
+    if not _version.GetFileVersionInfoW(path, 0, size, data):
+        return None
+
+    pointer = ctypes.c_void_p()
+    length = wintypes.UINT()
+    if not _version.VerQueryValueW(
+        data, "\\", ctypes.byref(pointer), ctypes.byref(length)
+    ):
+        return None
+    if not pointer.value or length.value < ctypes.sizeof(VS_FIXEDFILEINFO):
+        return None
+
+    info = VS_FIXEDFILEINFO.from_address(pointer.value)
+    if info.dwSignature != _VS_FFI_SIGNATURE:
+        return None
+    ms, ls = info.dwFileVersionMS, info.dwFileVersionLS
+    return f"{ms >> 16}.{ms & 0xFFFF}.{ls >> 16}.{ls & 0xFFFF}"
+
+
+def _read_varint(data: bytes | mmap.mmap, i: int) -> tuple[int, int]:
+    """Decode a protobuf varint.
+
+    Args:
+        data: The bytes to read from.
+        i: Offset of the varint's first byte.
+
+    Returns:
+        The decoded value and the offset just past it.
+    """
+    result = shift = 0
+    while True:
+        byte = data[i]
         i += 1
-
-    if len(pos) != 2:
-        die("expected an environment and a filename, e.g.\n"
-            "    python make_proto.py -LIVE -telemetry_live")
-    env, name = pos
-
-    # The filename is just a name; folders go through --out-dir. This also
-    # stops things like "-..\\..\\x" from writing somewhere unexpected.
-    if os.sep in name or "/" in name or "\\" in name:
-        die("the filename can't contain a path; use --out-dir for the folder")
-    if name.lower().endswith(".proto"):    # we append .proto ourselves
-        name = name[:-6]
-    if not name:
-        die("empty filename")
-    return env, name, opts
+        result |= (byte & 0x7F) << shift
+        shift += 7
+        if byte < 0x80:
+            return result, i
 
 
-def find_exe(base, env):
+def _descriptor_end(data: bytes | mmap.mmap, start: int) -> int:
+    """Return the offset where an embedded descriptor ends.
+
+    Reads protobuf fields from ``start`` until one appears that cannot
+    belong to a FileDescriptorProto.
+
+    Args:
+        data: The executable's bytes.
+        start: Offset of the descriptor's first byte.
+
+    Returns:
+        The offset just past the descriptor's last field.
     """
-    Build {base}\\{env}\\Bin64\\StarCitizen.exe and check that it exists.
-
-    The environment folder is matched case-insensitively, so "-ptu" works even
-    though the folder is called "PTU" (matters on case-sensitive filesystems;
-    harmless on Windows). If nothing matches, the error lists which
-    environments under `base` do contain the exe, which usually shows the typo.
-    """
-    if not os.path.isdir(base):
-        die(f"base folder not found: {base}\n"
-            f"       set it with --base or SC_BASE_DIR")
-
-    env_dir = os.path.join(base, env)
-    if not os.path.isdir(env_dir):
-        # Try a case-insensitive match against the folders in base
-        for d in os.listdir(base):
-            if d.lower() == env.lower() and os.path.isdir(os.path.join(base, d)):
-                env_dir = os.path.join(base, d)
+    i = start
+    size = len(data)
+    while i < size:
+        try:
+            tag, j = _read_varint(data, i)
+            wire_type = tag & 7
+            if wire_type not in _DESCRIPTOR_FIELDS.get(tag >> 3, ()):
                 break
-
-    exe = os.path.join(env_dir, EXE_TAIL)
-    if os.path.isfile(exe):
-        return exe
-
-    # Not found: tell the user what IS available
-    avail = sorted(d for d in os.listdir(base)
-                   if os.path.isfile(os.path.join(base, d, EXE_TAIL)))
-    die(f"not found: {exe}\n"
-        f"       environments with a Bin64\\StarCitizen.exe under {base}: "
-        f"{', '.join(avail) if avail else 'none'}")
-
-
-# ============================================================================
-# 2. Pulling the serialized descriptors out of the exe
-# ============================================================================
-# A FileDescriptorProto is a protobuf message describing one .proto file. It is
-# serialized in field-number order:
-#     1 name, 2 package, 3 dependency[], 4 message_type[], 5 enum_type[],
-#     6 service[], 8 options, 12 syntax
-# The first field (name) is encoded as:   0x0A <length byte> <name bytes>
-# so "0x0A 0x20 sc/game/telemetry/v1/types.proto" marks the start of one.
-# That is what we search the exe for.
-
-def varint(b, i):
-    """
-    Decode one protobuf varint from `b` starting at index `i`.
-    Returns (value, next_index), or (None, i) if the bytes run out or the
-    varint is longer than 10 bytes (so it can't be a real one).
-    """
-    v = s = 0
-    n = len(b)
-    while i < n:
-        c = b[i]
-        i += 1
-        v |= (c & 0x7F) << s          # low 7 bits carry data
-        if not c & 0x80:              # high bit clear = last byte
-            return v, i
-        s += 7
-        if s > 63:
-            break
-    return None, i
-
-
-def descriptor_end(data, start):
-    """
-    Given the offset where a descriptor starts, walk its top-level fields to
-    find where it ends. The exe doesn't tell us the length, and the bytes after
-    the descriptor are unrelated, so we stop as soon as the next thing can't be
-    a valid FileDescriptorProto field:
-
-      * field number outside 1..12
-      * field number going backwards (serialization is in ascending order)
-      * a wire type other than varint (0) or length-delimited (2)
-      * a length that runs past the end of the file
-      * after field 12 (`syntax`), which is always serialized last in proto3
-
-    Returns the offset just past the last valid field.
-    """
-    pos, last, n = start, 0, len(data)
-    while pos < n:
-        tag, p = varint(data, pos)
-        if tag is None:
-            break
-        fn, wt = tag >> 3, tag & 7    # field number, wire type
-        if fn < 1 or fn > 12 or fn < last or wt not in (0, 2):
-            break
-        if wt == 2:                   # length-delimited: skip over the payload
-            ln, p = varint(data, p)
-            if ln is None or p + ln > n:
-                break
-            p += ln
-        else:                         # varint: skip the value
-            v, p = varint(data, p)
-            if v is None:
-                break
-        last, pos = fn, p
-        if fn == 12:                  # `syntax` is last; nothing valid follows
-            break
-    return pos
-
-
-def extract_descriptors(exe, match):
-    """
-    Scan `exe` for embedded descriptors whose file name starts with `match`
-    and return them as a list of FileDescriptorProto objects.
-
-    The exe is memory-mapped instead of read into RAM (it is hundreds of MB).
-    Each hit is checked three ways before it's accepted: the length byte must
-    equal the name length, the bytes must parse as a FileDescriptorProto, and
-    the parsed name must equal the name we matched. Duplicate copies of the
-    same file (the exe may contain several) are kept only once.
-    """
-    prefix = re.escape(match.encode())
-    # 0x0A, one length byte (5..127), then a name that starts with the prefix
-    # and ends in .proto. Group 1 = length byte, group 2 = the name.
-    pat = re.compile(rb"\x0a([\x05-\x7f])(" + prefix + rb"[\w/.\-]*\.proto)")
-
-    found = {}  # file name -> FileDescriptorProto (dict = de-duplication)
-    with open(exe, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as data:
-        for m in pat.finditer(data):
-            # Reject accidental matches: the length byte must be the real length
-            if len(m.group(2)) != m.group(1)[0]:
-                continue
-            name = m.group(2).decode()
-            if name in found:
-                continue
-            # Slice out exactly one descriptor and let protobuf parse it
-            blob = data[m.start():descriptor_end(data, m.start())]
-            fd = descriptor_pb2.FileDescriptorProto()
-            try:
-                fd.ParseFromString(blob)
-            except Exception:
-                continue                  # not a real descriptor
-            # Final sanity checks: right file, and it actually defines something
-            if fd.name != name or not (fd.message_type or fd.enum_type or fd.service):
-                continue
-            found[name] = fd
-    return list(found.values())
-
-
-def dependency_order(files):
-    """
-    Sort files so each one comes after the files it imports (api.proto imports
-    types.proto, so types.proto must come first in the merged output).
-    Simple depth-first topological sort.
-    """
-    by = {f.name: f for f in files}
-    out, seen = [], set()
-
-    def visit(f):
-        if f.name in seen:
-            return
-        seen.add(f.name)
-        for d in f.dependency:
-            if d in by:               # only follow dependencies we extracted
-                visit(by[d])
-        out.append(f)                 # added after its dependencies
-
-    for f in files:
-        visit(f)
-    return out
-
-
-# ============================================================================
-# 3. Turning FileDescriptorProtos back into .proto text
-# ============================================================================
-class Writer:
-    """
-    Renders one or more FileDescriptorProtos as a single merged .proto file.
-
-    Everything is merged into one file, so references between the files
-    (api.proto using types from types.proto) no longer need imports. Type names
-    are written relative to the package (".sc.game.telemetry.v1.Gauge" becomes
-    "Gauge"), which is valid because everything is in the same package.
-    """
-
-    def __init__(self, files):
-        self.files = files
-        pkgs = [f.package for f in files]
-        self.pkg = pkgs[0]
-        if len(set(pkgs)) > 1:
-            print(f"warning: several packages found {sorted(set(pkgs))}; "
-                  f"only '{self.pkg}' is merged cleanly", file=sys.stderr)
-        self.proto3 = files[0].syntax == "proto3"
-        # Imports the merged file still needs: dependencies that are NOT among
-        # the files we extracted (e.g. google/protobuf/empty.proto). Our own
-        # files are merged in, so importing them would be circular.
-        names = {f.name for f in files}
-        self.imports = sorted({d for f in files for d in f.dependency} - names)
-
-    # ---- type names --------------------------------------------------------
-    def tname(self, t):
-        """'.sc.game.telemetry.v1.Gauge' -> 'Gauge' (strip package + leading dot)."""
-        pre = "." + self.pkg + "." if self.pkg else "."
-        return t[len(pre):] if t.startswith(pre) else t.lstrip(".")
-
-    def ftype(self, f):
-        """Type text for a field: a message/enum name, or a scalar like 'float'."""
-        if f.type in (FDP.TYPE_MESSAGE, FDP.TYPE_ENUM, FDP.TYPE_GROUP):
-            return self.tname(f.type_name)
-        return FDP.Type.Name(f.type)[5:].lower()    # TYPE_FLOAT -> float
-
-    # ---- enums -------------------------------------------------------------
-    def enum(self, e, ind):
-        """Render an enum (top-level or nested) at indent level `ind`."""
-        p = "  " * ind
-        out = [f"{p}enum {e.name} {{"]
-        if e.options.allow_alias:
-            out.append(f"{p}  option allow_alias = true;")
-        out += [f"{p}  {v.name} = {v.number};" for v in e.value]
-        out.append(f"{p}}}")
-        return out
-
-    @staticmethod
-    def ranges(rs):
-        """Format reserved ranges like '2, 5 to 9'. (End values are exclusive.)"""
-        parts = []
-        for r in rs:
-            end = r.end - 1
-            end_s = "max" if end >= 536870911 else str(end)
-            parts.append(str(r.start) if end == r.start else f"{r.start} to {end_s}")
-        return ", ".join(parts)
-
-    # ---- messages ----------------------------------------------------------
-    def message(self, m, ind):
-        """
-        Render a message, including nested messages/enums, oneofs, map fields
-        and reserved ranges. Returns a list of lines.
-        """
-        p = "  " * ind
-        # Map fields are stored as a hidden nested "XxxEntry" message flagged
-        # map_entry. Collect them so we can print `map<K, V>` and not emit the
-        # hidden message itself.
-        maps = {n.name: n for n in m.nested_type if n.options.map_entry}
-        out = [f"{p}message {m.name} {{"]
-        done_oneofs = set()
-
-        def field_line(f, q):
-            """One field: handles map<>, repeated, optional/required labels."""
-            typ = self.ftype(f)
-            # A repeated field whose type is a hidden *Entry message is a map
-            entry = (maps.get(f.type_name.rsplit(".", 1)[-1])
-                     if f.type == FDP.TYPE_MESSAGE else None)
-            if entry is not None and f.label == FDP.LABEL_REPEATED:
-                k, v = entry.field[0], entry.field[1]   # key=1, value=2
-                return f"{q}map<{self.ftype(k)}, {self.ftype(v)}> {f.name} = {f.number};"
-            if f.label == FDP.LABEL_REPEATED:
-                lab = "repeated "
-            elif f.proto3_optional:                     # explicit `optional` in proto3
-                lab = "optional "
-            elif not self.proto3 and f.label == FDP.LABEL_REQUIRED:
-                lab = "required "
-            elif not self.proto3:                       # proto2 needs a label on everything
-                lab = "optional "
-            else:                                       # plain proto3 field: no label
-                lab = ""
-            return f"{q}{lab}{typ} {f.name} = {f.number};"
-
-        for f in m.field:
-            if f.HasField("oneof_index") and not f.proto3_optional:
-                # Part of a real oneof: print the whole group the first time
-                # we meet any member, in place of that member.
-                oi = f.oneof_index
-                if oi in done_oneofs:
-                    continue
-                done_oneofs.add(oi)
-                out.append(f"{p}  oneof {m.oneof_decl[oi].name} {{")
-                for g in m.field:
-                    if g.HasField("oneof_index") and g.oneof_index == oi:
-                        out.append(field_line(g, p + "    ").replace("optional ", "", 1))
-                out.append(f"{p}  }}")
+            if wire_type == 0:
+                _, j = _read_varint(data, j)
             else:
-                out.append(field_line(f, p + "  "))
-
-        if m.reserved_range:
-            out.append(f"{p}  reserved {self.ranges(m.reserved_range)};")
-        if m.reserved_name:
-            out.append(f"{p}  reserved " + ", ".join(f'"{n}"' for n in m.reserved_name) + ";")
-        for e in m.enum_type:                    # nested enums
-            out += self.enum(e, ind + 1)
-        for n in m.nested_type:                  # nested messages (not map entries)
-            if n.name not in maps:
-                out += self.message(n, ind + 1)
-        out.append(f"{p}}}")
-        return out
-
-    # ---- services ----------------------------------------------------------
-    def service(self, s):
-        """Render a service and its rpc methods, keeping `stream` markers."""
-        out = [f"service {s.name} {{"]
-        for m in s.method:
-            cs = "stream " if m.client_streaming else ""
-            ss = "stream " if m.server_streaming else ""
-            out.append(f"  rpc {m.name}({cs}{self.tname(m.input_type)}) "
-                       f"returns ({ss}{self.tname(m.output_type)});")
-        out.append("}")
-        return out
-
-    # ---- whole file --------------------------------------------------------
-    def render(self, header_lines):
-        """Produce the full .proto text: header, syntax, package, then each
-        source file's enums, messages and services in dependency order."""
-        out = [f"// {h}" for h in header_lines]
-        out.append("")
-        out.append('syntax = "proto3";' if self.proto3 else 'syntax = "proto2";')
-        if self.pkg:
-            out.append(f"package {self.pkg};")
-        for imp in self.imports:
-            out.append(f'import "{imp}";')
-        for f in self.files:
-            out.append("")
-            out.append(f"// ---- from {f.name} ----")
-            for e in f.enum_type:
-                out.append("")
-                out += self.enum(e, 0)
-            for m in f.message_type:
-                out.append("")
-                out += self.message(m, 0)
-            for s in f.service:
-                out.append("")
-                out += self.service(s)
-        return "\n".join(out) + "\n"
-
-    # ---- sanity check ------------------------------------------------------
-    def unresolved(self):
-        """
-        Return every type that is referenced (by a field or rpc) but not
-        defined in the extracted files. An empty list means the output is
-        self-contained. Types from google.protobuf.* are ignored since those
-        come from standard imports.
-        """
-        defined = set()
-
-        def walk(prefix, msgs, enums):
-            """Collect the full name of every enum and message, nested included."""
-            for e in enums:
-                defined.add(f"{prefix}.{e.name}")
-            for m in msgs:
-                full = f"{prefix}.{m.name}"
-                defined.add(full)
-                walk(full, m.nested_type, m.enum_type)
-
-        refs = set()
-
-        def refwalk(msgs):
-            """Collect every type name that a field refers to."""
-            for m in msgs:
-                for f in m.field:
-                    if f.type_name:
-                        refs.add(f.type_name)
-                refwalk(m.nested_type)
-
-        for f in self.files:
-            walk("." + f.package, f.message_type, f.enum_type)
-            refwalk(f.message_type)
-            for s in f.service:
-                for m in s.method:
-                    refs.update((m.input_type, m.output_type))
-        return sorted(r for r in refs
-                      if r not in defined and not r.startswith(".google.protobuf."))
+                length, j = _read_varint(data, j)
+                j += length
+        except IndexError:
+            break
+        if j > size:
+            break
+        i = j
+    return i
 
 
-# ============================================================================
-# 4. Main
-# ============================================================================
-def count_messages(msgs):
-    """Count messages including nested ones (used for the summary line)."""
-    return sum(1 + count_messages(m.nested_type) for m in msgs)
+def _iter_telemetry_names(
+    data: bytes | mmap.mmap,
+) -> Iterator[tuple[int, str]]:
+    """Yield the location and name of each embedded telemetry schema.
+
+    A schema's file name is stored as byte 0x0A, a one-byte length and
+    then the name itself, so a match on the telemetry prefix is only
+    accepted if those two bytes come right before it.
+
+    Args:
+        data: The executable's bytes.
+
+    Yields:
+        The offset where the descriptor starts and its .proto file name.
+    """
+    hit = data.find(_TELEMETRY_PREFIX)
+    while hit != -1:
+        start = hit - 2
+        if start >= 0 and data[start] == 0x0A and data[hit - 1] < 0x80:
+            raw = data[hit:hit + data[hit - 1]]
+            try:
+                name = raw.decode("ascii")
+            except UnicodeDecodeError:
+                name = ""
+            if name.endswith(".proto") and name.isprintable():
+                yield start, name
+        hit = data.find(_TELEMETRY_PREFIX, hit + 1)
 
 
-def main():
-    # 1. Work out which exe to read and what to call the output
-    env, name, opts = parse_cli(sys.argv[1:])
-    exe = find_exe(opts["base"], env)
-    print(f"reading {exe}")
+def find_telemetry_descriptors(
+    path: str,
+) -> dict[str, descriptor_pb2.FileDescriptorProto]:
+    """Return the telemetry .proto descriptors embedded in a file.
 
-    # 2. Pull the embedded descriptors out of the exe
-    files = extract_descriptors(exe, opts["match"])
-    if not files:
-        die(f"no embedded '{opts['match']}*.proto' descriptors found in that exe.\n"
-            f"       The build may have stripped them (lite runtime), or the path prefix\n"
-            f"       differs; try --match with a different prefix.")
-    files = dependency_order(files)
+    The file is memory-mapped rather than read into memory, so only the
+    pages the search touches are loaded and nothing has to be copied.
 
-    # 3. Check the dump is self-contained; warn (don't fail) if not
-    w = Writer(files)
-    bad = w.unresolved()
-    if bad:
-        print("warning: types referenced but not defined in the dumped files:", file=sys.stderr)
-        for b in bad:
-            print("   ", b, file=sys.stderr)
+    Args:
+        path: Full path to the executable.
 
-    # 4. Render and write the .proto. The header names the environment folder
-    #    that was actually read, plus the date, so old dumps can be told apart.
-    header = [f"Dumped from the {os.path.basename(os.path.dirname(os.path.dirname(exe)))} build"
-              f" - {datetime.date.today().isoformat()}",
-              "Reconstructed from the descriptor embedded in StarCitizen.exe."]
-    text = w.render(header)
+    Returns:
+        A mapping of .proto file name to its descriptor, in the order
+        they appear. The mapping is empty if none are found.
+    """
+    descriptors: dict[str, descriptor_pb2.FileDescriptorProto] = {}
+    with (
+        open(path, "rb") as file,
+        mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ) as data,
+    ):
+        for start, name in _iter_telemetry_names(data):
+            if name in descriptors:
+                continue
+            descriptor = descriptor_pb2.FileDescriptorProto()
+            try:
+                descriptor.ParseFromString(
+                    data[start:_descriptor_end(data, start)]
+                )
+            except Exception:
+                continue
+            if (
+                descriptor.message_type
+                or descriptor.enum_type
+                or descriptor.service
+            ):
+                descriptors[name] = descriptor
+    return descriptors
 
-    os.makedirs(opts["out_dir"], exist_ok=True)
-    out_path = os.path.join(opts["out_dir"], name + ".proto")
-    with open(out_path, "w", encoding="utf-8", newline="\n") as f:
-        f.write(text)
 
-    # 5. Summary
-    nmsg = sum(count_messages(f.message_type) for f in files)
-    nsvc = [f"{s.name} ({len(s.method)} rpc)" for f in files for s in f.service]
-    print(f"found {len(files)} files: " + ", ".join(f.name for f in files))
-    print(f"{nmsg} messages; services: {', '.join(nsvc) or 'none'}")
-    print(f"wrote {out_path}")
+def _quote(text: str) -> str:
+    """Return ``text`` as a double-quoted .proto string literal."""
+    escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _options(options) -> list[str]:
+    """Return ``name = value`` strings for every option that is set.
+
+    Args:
+        options: A protobuf options message (file, message, field, ...).
+
+    Returns:
+        One ``name = value`` string per option. The internal
+        ``map_entry`` option is left out.
+    """
+    result = []
+    for field, value in options.ListFields():
+        if field.name == "map_entry":
+            continue
+        if field.enum_type is not None:
+            text = field.enum_type.values_by_number[value].name
+        elif isinstance(value, bool):
+            text = "true" if value else "false"
+        elif isinstance(value, str):
+            text = _quote(value)
+        else:
+            text = str(value)
+        result.append(f"{field.name} = {text}")
+    return result
+
+
+def _default_json_name(name: str) -> str:
+    """Return the JSON name protoc generates by default for a field."""
+    parts = name.split("_")
+    return parts[0] + "".join(p[:1].upper() + p[1:] for p in parts[1:])
+
+
+def _short_type(type_name: str, package: str, scope: list[str]) -> str:
+    """Shorten a fully-qualified type name for use inside a definition.
+
+    Args:
+        type_name: The fully-qualified name, e.g. ``.pkg.Outer.Inner``.
+        package: The package of the file being printed.
+        scope: Names of the enclosing messages, outermost first.
+
+    Returns:
+        The shortest name that still refers to the same type.
+    """
+    name = type_name.lstrip(".")
+    if package and name.startswith(package + "."):
+        name = name[len(package) + 1:]
+    for depth in range(len(scope), 0, -1):
+        prefix = ".".join(scope[:depth]) + "."
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return name
+
+
+def _field_type(field, package: str, scope: list[str]) -> str:
+    """Return the .proto type name of a field."""
+    if field.type in (FDP.TYPE_MESSAGE, FDP.TYPE_ENUM, FDP.TYPE_GROUP):
+        return _short_type(field.type_name, package, scope)
+    return FDP.Type.Name(field.type)[len("TYPE_"):].lower()
+
+
+def _field_statement(
+    field, package: str, scope: list[str], map_entries: dict, syntax: str,
+    in_oneof: bool = False,
+) -> str:
+    """Return a field definition, e.g. ``repeated string names = 3;``."""
+    entry = None
+    if field.label == FDP.LABEL_REPEATED and field.type == FDP.TYPE_MESSAGE:
+        entry = map_entries.get(field.type_name.rsplit(".", 1)[-1])
+
+    if entry is not None:
+        key_type = _field_type(entry.field[0], package, scope)
+        value_type = _field_type(entry.field[1], package, scope)
+        prefix = f"map<{key_type}, {value_type}>"
+    else:
+        label = ""
+        if field.label == FDP.LABEL_REPEATED:
+            label = "repeated "
+        elif field.proto3_optional:
+            label = "optional "
+        elif field.label == FDP.LABEL_REQUIRED:
+            label = "required "
+        elif syntax != "proto3" and not in_oneof:
+            label = "optional "
+        prefix = label + _field_type(field, package, scope)
+
+    options = []
+    if field.HasField("default_value"):
+        value = field.default_value
+        if field.type in (FDP.TYPE_STRING, FDP.TYPE_BYTES):
+            value = _quote(value)
+        options.append(f"default = {value}")
+    if field.HasField("json_name") and (
+        field.json_name != _default_json_name(field.name)
+    ):
+        options.append(f"json_name = {_quote(field.json_name)}")
+    if field.HasField("options"):
+        options.extend(_options(field.options))
+    suffix = f" [{', '.join(options)}]" if options else ""
+    return f"{prefix} {field.name} = {field.number}{suffix};"
+
+
+def _reserved_statements(ranges, names, inclusive_end: bool) -> list[str]:
+    """Return ``reserved`` statements for numbers and names."""
+    statements = []
+    parts = []
+    for r in ranges:
+        end = r.end if inclusive_end else r.end - 1
+        parts.append(str(r.start) if r.start == end else f"{r.start} to {end}")
+    if parts:
+        statements.append(f"reserved {', '.join(parts)};")
+    if names:
+        statements.append(f"reserved {', '.join(_quote(n) for n in names)};")
+    return statements
+
+
+def _block(depth: int, head: str, items: list) -> list[str]:
+    """Render a ``head { ... }`` block as indented lines.
+
+    Args:
+        depth: Indentation level of the block.
+        head: The text before the brace, e.g. ``message Gauge``.
+        items: The block's contents, in order. Each item is either a
+            statement string or a list of already-rendered lines for a
+            nested block.
+
+    Returns:
+        A single line if the block has no nested blocks and fits within
+        ``LINE_LIMIT``, otherwise one line per statement.
+    """
+    pad = "  " * depth
+    if all(isinstance(item, str) for item in items):
+        if not items:
+            return [f"{pad}{head} {{}}"]
+        line = f"{pad}{head} {{ {' '.join(items)} }}"
+        if len(line) <= LINE_LIMIT:
+            return [line]
+    lines = [f"{pad}{head} {{"]
+    for item in items:
+        if isinstance(item, str):
+            lines.append(f"{pad}  {item}")
+        else:
+            lines.extend(item)
+    lines.append(f"{pad}}}")
+    return lines
+
+
+def _render_enum(enum, depth: int) -> list[str]:
+    """Render an enum definition as indented lines."""
+    items: list = []
+    if enum.HasField("options"):
+        items.extend(f"option {o};" for o in _options(enum.options))
+    for value in enum.value:
+        options = _options(value.options) if value.HasField("options") else []
+        suffix = f" [{', '.join(options)}]" if options else ""
+        items.append(f"{value.name} = {value.number}{suffix};")
+    items.extend(_reserved_statements(
+        enum.reserved_range, enum.reserved_name, inclusive_end=True,
+    ))
+    return _block(depth, f"enum {enum.name}", items)
+
+
+def _render_message(
+    message, depth: int, package: str, scope: list[str], syntax: str,
+) -> list[str]:
+    """Render a message definition, including nested types, as lines."""
+    inner_scope = scope + [message.name]
+    map_entries = {
+        nested.name: nested
+        for nested in message.nested_type
+        if nested.options.map_entry
+    }
+    items: list = []
+    if message.HasField("options"):
+        items.extend(f"option {o};" for o in _options(message.options))
+    for enum in message.enum_type:
+        items.append(_render_enum(enum, depth + 1))
+    for nested in message.nested_type:
+        if nested.name not in map_entries:
+            items.append(_render_message(
+                nested, depth + 1, package, inner_scope, syntax,
+            ))
+
+    # Oneofs created only to support proto3 "optional" are not printed.
+    real_oneofs = {
+        field.oneof_index
+        for field in message.field
+        if field.HasField("oneof_index") and not field.proto3_optional
+    }
+    printed_oneofs: set[int] = set()
+    for field in message.field:
+        index = field.oneof_index if field.HasField("oneof_index") else None
+        if index not in real_oneofs:
+            items.append(_field_statement(
+                field, package, inner_scope, map_entries, syntax,
+            ))
+            continue
+        if index in printed_oneofs:
+            continue
+        printed_oneofs.add(index)
+        members = [
+            _field_statement(
+                member, package, inner_scope, map_entries, syntax,
+                in_oneof=True,
+            )
+            for member in message.field
+            if member.HasField("oneof_index") and member.oneof_index == index
+        ]
+        items.append(_block(
+            depth + 1, f"oneof {message.oneof_decl[index].name}", members,
+        ))
+
+    items.extend(_reserved_statements(
+        message.reserved_range, message.reserved_name, inclusive_end=False,
+    ))
+    return _block(depth, f"message {message.name}", items)
+
+
+def _render_service(service, package: str) -> list[str]:
+    """Render a gRPC service definition as lines."""
+    items: list = []
+    if service.HasField("options"):
+        items.extend(f"option {o};" for o in _options(service.options))
+    for method in service.method:
+        request = _short_type(method.input_type, package, [])
+        response = _short_type(method.output_type, package, [])
+        if method.client_streaming:
+            request = f"stream {request}"
+        if method.server_streaming:
+            response = f"stream {response}"
+        options = (
+            _options(method.options) if method.HasField("options") else []
+        )
+        body = (
+            " { " + " ".join(f"option {o};" for o in options) + " }"
+            if options else ";"
+        )
+        items.append(
+            f"rpc {method.name}({request}) returns ({response}){body}"
+        )
+    return _block(0, f"service {service.name}", items)
+
+
+def render_proto(
+    descriptor: descriptor_pb2.FileDescriptorProto, comment_lines: list[str],
+) -> str:
+    """Rebuild .proto source text from a file descriptor.
+
+    Args:
+        descriptor: The file descriptor to render.
+        comment_lines: Lines of the comment block printed under the
+            header. Each line is prefixed with ``//``.
+
+    Returns:
+        The .proto source. Comments from the original source are not
+        included because they are not stored in the descriptor.
+    """
+    package = descriptor.package
+    syntax = descriptor.syntax or "proto2"
+    lines = [f'syntax = "{syntax}";']
+    if package:
+        lines.append(f"package {package};")
+    public = set(descriptor.public_dependency)
+    weak = set(descriptor.weak_dependency)
+    for index, dependency in enumerate(descriptor.dependency):
+        modifier = (
+            "public " if index in public else "weak " if index in weak else ""
+        )
+        lines.append(f"import {modifier}{_quote(dependency)};")
+    lines.append("")
+    lines.extend(f"// {line}".rstrip() for line in comment_lines)
+    lines.append("")
+    if descriptor.HasField("options"):
+        lines.extend(f"option {o};" for o in _options(descriptor.options))
+        lines.append("")
+
+    blocks = [_render_enum(enum, 0) for enum in descriptor.enum_type]
+    blocks += [
+        _render_message(message, 0, package, [], syntax)
+        for message in descriptor.message_type
+    ]
+    blocks += [
+        _render_service(service, package) for service in descriptor.service
+    ]
+
+    # Consecutive one-line definitions sit together; a blank line
+    # separates anything that spans several lines.
+    previous: list[str] | None = None
+    for block in blocks:
+        if previous is not None and (len(previous) > 1 or len(block) > 1):
+            lines.append("")
+        lines.extend(block)
+        previous = block
+    return "\n".join(lines) + "\n"
+
+
+def merge_descriptors(
+    descriptors: dict[str, descriptor_pb2.FileDescriptorProto], name: str,
+) -> descriptor_pb2.FileDescriptorProto:
+    """Combine several .proto file descriptors into one.
+
+    Imports between the combined files are dropped, because their
+    definitions are now in the same file. All files must share the same
+    package.
+
+    Args:
+        descriptors: The descriptors to combine, keyed by file name.
+        name: File name for the combined descriptor.
+
+    Returns:
+        A single descriptor containing every definition.
+
+    Raises:
+        ValueError: If the files use different packages.
+    """
+    packages = {d.package for d in descriptors.values()}
+    if len(packages) > 1:
+        raise ValueError(f"Cannot merge different packages: {packages}")
+
+    merged = descriptor_pb2.FileDescriptorProto(name=name)
+    if packages:
+        merged.package = packages.pop()
+    for descriptor in descriptors.values():
+        if descriptor.syntax:
+            merged.syntax = descriptor.syntax
+        if descriptor.HasField("options") and not merged.HasField("options"):
+            merged.options.CopyFrom(descriptor.options)
+        merged.message_type.extend(descriptor.message_type)
+        merged.enum_type.extend(descriptor.enum_type)
+        merged.service.extend(descriptor.service)
+        for dependency in descriptor.dependency:
+            if dependency not in descriptors and (
+                dependency not in merged.dependency
+            ):
+                merged.dependency.append(dependency)
+    return merged
+
+
+def wait_for_process(exe_name: str = EXE_NAME) -> int:
+    """Block until the named process is running and return its PID.
+
+    Args:
+        exe_name: The process image name to wait for.
+
+    Returns:
+        The process ID once the process is running.
+    """
+    print(f"Waiting for {exe_name} to start...")
+    while (pid := find_pid(exe_name)) is None:
+        time.sleep(CHECK_INTERVAL)
+    return pid
 
 
 if __name__ == "__main__":
-    main()
+    pid = wait_for_process()
+    exe_path = get_exe_path(pid)
+    file_version = get_file_version(exe_path) if exe_path else None
+    telemetry_descriptors = (
+        find_telemetry_descriptors(exe_path) if exe_path else {}
+    )
+    if telemetry_descriptors:
+        channel = Path(exe_path).parent.parent.name
+        output_path = (
+            Path(__file__).parent / f"sc_telemetry_{file_version}.proto"
+        )
+        merged = merge_descriptors(telemetry_descriptors, output_path.name)
+        services = ", ".join(service.name for service in merged.service)
+        comment_lines = [
+            "---- Star Citizen game telemetry gRPC schema ----",
+            "",
+            f"What it is: the protobuf schema of the game's telemetry gRPC "
+            f"API ({services}),",
+            "including the telemetry frame messages it streams.",
+            "",
+            f"Compatible with: StarCitizen.exe file version {file_version} "
+            f"({channel}).",
+            "Other game versions may add, remove or change fields.",
+            "",
+            "Source: reconstructed from the descriptors embedded in "
+            "StarCitizen.exe:",
+            *(f"  {name}" for name in telemetry_descriptors),
+            "Original source comments are not stored in the exe, so none "
+            "are included.",
+        ]
+        proto_text = render_proto(merged, comment_lines)
+        output_path.write_text(proto_text, encoding="utf-8")
+        print(f"Wrote {output_path}")
+    else:
+        print("No telemetry proto found")
