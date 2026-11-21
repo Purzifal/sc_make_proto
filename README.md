@@ -1,4 +1,4 @@
-# sc_make_proto_auto
+# sc_make_proto
 
 Create the Star Citizen telemetry schema file straight from your installed game, with one command.
 
@@ -35,7 +35,7 @@ pip install -r requirements.txt
 4. A moment later the script saves the file and closes:
    ```
    Waiting for StarCitizen.exe to start...
-   Wrote F:\...\sc_make_proto_auto\sc_telemetry_5.0.202.10025.proto
+   Wrote F:\...\sc_make_proto\sc_telemetry_5.0.202.10025.proto
    ```
 
 That's it. The game doesn't need to stay open after this.
@@ -111,6 +111,7 @@ python -m grpc_tools.protoc -I. --descriptor_set_out=sc_telemetry.pb sc_telemetr
 - **Proto3 only:** if a future game version used proto2, the script would stop with "No telemetry proto found" rather than write a wrong file.
 - **Options are not written out.** The file still compiles.
 - **The game's API:** the service is `GameTelemetryService`, served locally on `127.0.0.1:2942`. It has a `TelemetryStream` call for live data, and in 5.0 and later also `ListTriggerableActions` and `TriggerGameAction`.
+- **Read the live data or send commands:** see [sc_telemetry_demo](https://github.com/Purzifal/sc_telemetry_demo), standalone Python scripts that connect to this API.
 
 ## License
 
