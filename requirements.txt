@@ -1,0 +1,6 @@
+# make_proto.py needs only this (Python 3.8+):
+protobuf>=3.20
+
+# Needed afterwards to compile the .proto and talk to the game's server:
+grpcio>=1.50
+grpcio-tools>=1.50
