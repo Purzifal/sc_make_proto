@@ -1,4 +1,4 @@
-# sc_make_proto_auto
+# sc_make_proto
 
 Automatically generate the Star Citizen game telemetry `.proto` schema from your installed game.
 
